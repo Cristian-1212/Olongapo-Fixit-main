@@ -1,0 +1,240 @@
+const os=require('os'),path=require('path'),fs=require('fs');
+process.env.PORT='0';process.env.DB_FILE=path.join(os.tmpdir(),`olongapo-fixit-api-${process.pid}.db`);
+process.env.IMAGE_VERIFY_DISABLED='1';
+for(const suffix of ['','-wal','-shm'])try{fs.unlinkSync(process.env.DB_FILE+suffix)}catch(e){}
+const srv=require('./server.js');
+const assert=require('assert');
+let base;
+const cookieStr=(jar)=>{const cs=[];if(jar.c)cs.push(jar.c);if(jar.xcsrf)cs.push('csrf_token='+jar.xcsrf);return cs.join('; ')};
+const J=(jar)=>async(m,p,b)=>{const h={'Content-Type':'application/json',cookie:cookieStr(jar)};if(m!=='GET'&&jar.xcsrf)h['X-CSRF-Token']=jar.xcsrf;const r=await fetch(new URL('/api/'+p,base),{method:m,headers:h,body:b?JSON.stringify(b):undefined});const scs=r.headers.getSetCookie?r.headers.getSetCookie():[];for(const sc of scs){const c=sc.split(';')[0];if(c.startsWith('sid='))jar.c=c;else if(c.startsWith('csrf_token='))jar.xcsrf=c.slice(11);}let j;try{j=await r.json()}catch(e){j=null}return{s:r.status,j}};
+const user=async(e,pw)=>{const jar={},f=J(jar);const r=await f('POST','login',{email:e,password:pw});assert.equal(r.s,200,e);return f};
+const JPG='data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAAA//aAAgBAQAAPwA=';
+// Mock Gemini API for all tests - MUST be before any chat calls
+const originalGeminiKey=process.env.GEMINI_API_KEY,originalFetch=global.fetch,geminiRequests=[];
+let mockCallCount=0;
+process.env.GEMINI_API_KEY='test-server-key';
+global.fetch=async(url,options)=>{
+  if(String(url).startsWith('https://generativelanguage.googleapis.com/')){
+    geminiRequests.push({url:String(url),options,body:JSON.parse(options.body)});
+    mockCallCount++;
+    const n=mockCallCount;
+    // First call: return tool call for admin, text for others
+    // Second call: return text response
+    if(n%2===1){
+      // Check if this is an admin request with tools
+      const body=JSON.parse(options.body);
+      const hasTools=body.tools && body.tools[0] && body.tools[0].functionDeclarations && body.tools[0].functionDeclarations.length>0;
+      if(hasTools){
+        return{ok:true,json:async()=>{const calls=[{name:'get_barangay_stats',args:{barangay:'Kalalake'}},{name:'get_barangay_stats',args:{barangay:'Kalalake'}},{name:'search_resident',args:{name:'Ana',barangay:'Pag-asa'}},{name:'get_barangay_stats',args:{barangay:'Kalalake'}}];return{candidates:[{content:{role:'model',parts:[{functionCall:calls[(n-1)/2]}]}}]}}};
+      }
+      // No tools (guest/resident) - return text directly
+      return{ok:true,json:async()=>{return{candidates:[{content:{role:'model',parts:[{text:'Here is the information.'}]}}]}}};
+    }
+    // Second call (tool result) - return text
+    return{ok:true,json:async()=>{return{candidates:[{content:{role:'model',parts:[{text:'Here is the information.'}]}}]}}};
+  }
+  return originalFetch(url,options)
+};
+(async()=>{
+ if(!srv.listening)await new Promise((resolve,reject)=>{srv.once('listening',resolve);srv.once('error',reject)});
+ base='http://127.0.0.1:'+srv.address().port+'/';
+ const anon=J({});assert.equal((await anon('GET','state')).j.me,null);assert.equal((await anon('POST','report',{})).s,401);assert.equal((await anon('POST','assistant/chat',{})).s,404);assert.equal((await anon('GET','people-map')).s,401);assert.equal((await anon('POST','chat',{message:'Hello'})).s,200);
+ assert.equal((await anon('POST','login',{email:'admin@fixit.ph',password:'bad'})).s,401);
+ const admin=await user('admin@fixit.ph','admin123'),cap=await user('pagasa@fixit.ph','demo123'),sec=await user('newkalalake@fixit.ph','demo123'),city=await user('engineer@fixit.ph','demo123'),ana=await user('resident@fixit.ph','demo123'),ben=await user('ben@fixit.ph','demo123');
+ const st=async f=>(await f('GET','state')).j.S;
+ const A=await st(admin),C=await st(cap),Sc=await st(sec),Ci=await st(city),An=await st(ana),Be=await st(ben);
+  assert.equal((await admin('POST','chat',{message:'x'.repeat(1001)})).s,400,'chat message length');assert.equal((await admin('POST','chat',{message:'hello',history:Array(11).fill({role:'user',content:'hi'})})).s,400,'chat history length');{const noImg=await admin('POST','chat',{message:'hello',image:'data:image/png;base64,abc'});assert.equal(noImg.s,400,'image payload rejected');assert(/text questions only/i.test(noImg.j.error)&&/cannot read images/i.test(noImg.j.error),'image payload message');const noImgHist=await admin('POST','chat',{message:'hello',history:[{role:'user',content:'hi',attachments:[{}]}]});assert.equal(noImgHist.s,400,'history attachment rejected');const noFileHist=await admin('POST','chat',{message:'hello',history:[{role:'user',content:'hi',file:{name:'x.png'}}]});assert.equal(noFileHist.s,400,'history file rejected')}assert.equal((await ana('GET','chat/insights')).s,403,'resident cannot view chat insights');assert.equal((await cap('GET','chat/insights')).s,403,'barangay official cannot view global insights');assert.equal((await ana('POST','chat/service/save',{name:'X',requirements:'X',fee:'X',officeHours:'X'})).s,403,'resident cannot configure service details');
+  mockCallCount=0;
+  geminiRequests.length=0;
+ 
+ try{const response=await admin('POST','chat',{message:'How many residents are in Kalalake?',history:[]});assert.equal(response.s,200,JSON.stringify(response.j));assert(/information/i.test(response.j.reply));assert.equal(response.j.topic,'residents');assert(geminiRequests[0].options.headers['x-goog-api-key']==='test-server-key','server key sent only in upstream header');assert(!JSON.stringify(response.j).includes('test-server-key'));assert(!JSON.stringify(geminiRequests[1].body.contents).includes('"address"'),'resident addresses are not sent to model');assert(geminiRequests[0].body.tools[0].functionDeclarations.some(x=>x.name==='search_resident'));assert.equal((await ana('POST','chat',{message:'How many residents are in Kalalake?',history:[]})).s,200);assert(!geminiRequests[2].body.tools[0].functionDeclarations.some(x=>x.name==='search_resident'),'resident tools exclude other residents');const residentTool=await admin('POST','chat',{message:'Find resident Ana in Pag-asa',history:[]});assert.equal(residentTool.s,200);const residentData=JSON.stringify(geminiRequests[5].body.contents);assert(residentData.includes('Ana Resident')&&residentData.includes('verificationStatus'));assert(!/address|phone|birthdate|email|\\bage\\b/i.test(residentData),'resident tool data is minimized');assert.equal((await cap('POST','chat',{message:'How many residents are in Kalalake?',history:[]})).s,200);const scoped=JSON.stringify(geminiRequests[7].body.contents);assert(scoped.includes('own barangay')&&!scoped.includes('"residents":'),'barangay staff cannot query another barangay');assert.equal((await admin('POST','chat/feedback',{topic:'residents',vote:'up'})).s,200);const insights=(await admin('GET','chat/insights')).j;assert(insights.questions.some(x=>x.topic==='residents'&&x.count===4));assert(insights.feedback.some(x=>x.topic==='residents'&&x.vote==='up'&&x.count===1));assert.equal((await admin('POST','chat/service/save',{name:'Test Verified Service',requirements:'Bring the required form.',fee:'No fee',officeHours:'Weekdays only'})).s,200);const listing=(await admin('GET','chat/services')).j;assert(listing.services.some(x=>x.name==='Test Verified Service'));assert.equal((await ana('POST','chat/service/delete',{id:listing.services.find(x=>x.name==='Test Verified Service').id})).s,403);assert.equal((await admin('POST','chat/service/delete',{id:listing.services.find(x=>x.name==='Test Verified Service').id})).s,200);const key=process.env.GEMINI_API_KEY;delete process.env.GEMINI_API_KEY;const notConfigured=await admin('POST','chat',{message:'Hello',history:[]});assert.equal(notConfigured.s,503,'missing server key has explicit fallback status');assert(/not configured/i.test(notConfigured.j.error)&&/administrator/i.test(notConfigured.j.error),'missing key admin message');process.env.GEMINI_API_KEY='replace-with-your-server-side-key';const placeholder=await admin('POST','chat',{message:'Hello',history:[]});assert.equal(placeholder.s,503,'placeholder key treated as missing');assert(/not configured/i.test(placeholder.j.error),'placeholder key admin message');process.env.GEMINI_API_KEY='test-server-key';if(key!==undefined)process.env.GEMINI_API_KEY=key;else process.env.GEMINI_API_KEY='test-server-key'}catch(e){throw e}finally{global.fetch=originalFetch;if(originalGeminiKey===undefined)delete process.env.GEMINI_API_KEY;else process.env.GEMINI_API_KEY=originalGeminiKey}
+  // Gemini error handling (mocked, no real key/network)
+  {const prevKey=process.env.GEMINI_API_KEY,prevFetch=global.fetch;process.env.GEMINI_API_KEY='test-server-key';const mock=async(status,body,asThrow)=>{global.fetch=async(url,opts)=>{if(String(url).startsWith('https://generativelanguage.googleapis.com/')){if(asThrow)throw asThrow;return{ok:status>=200&&status<300,status,json:async()=>body,text:async()=>JSON.stringify(body)}};return prevFetch(url,opts)};return await admin('POST','chat',{message:'Hello',history:[]})};try{let r=await mock(400,{error:{status:'INVALID_ARGUMENT',message:'Cannot read image.png (this model does not support image input).'}});assert.equal(r.s,400,'image unsupported status');assert(/text questions only/i.test(r.j.error)&&/cannot read images/i.test(r.j.error)&&!/does not support image input/i.test(r.j.error),'image unsupported safe message');r=await mock(401,{error:{status:'UNAUTHENTICATED',message:'API key not valid'}});assert.equal(r.s,502,'invalid key status');assert(/api key is invalid/i.test(r.j.error)&&!/not valid|UNAUTHENTICATED/.test(r.j.error),'invalid key safe message');assert(!/test-server-key/.test(JSON.stringify(r.j)),'no key leak');r=await mock(429,{error:{status:'RESOURCE_EXHAUSTED',message:'Quota exceeded'}});assert.equal(r.s,429,'quota status');assert(/quota/i.test(r.j.error),'quota message');r=await mock(503,{error:{status:'UNAVAILABLE',message:'overloaded'}});assert.equal(r.s,503,'unavailable status');assert(/temporarily unavailable/i.test(r.j.error),'unavailable message');r=await mock(200,{},{name:'AbortError'});assert.equal(r.s,504,'timeout status');assert(/took too long/i.test(r.j.error),'timeout message');r=await mock(200,{},{name:'TypeError',message:'network down'});assert.equal(r.s,502,'network status');assert(/cannot currently be reached/i.test(r.j.error),'network message')}finally{global.fetch=prevFetch;if(prevKey===undefined)delete process.env.GEMINI_API_KEY;else process.env.GEMINI_API_KEY=prevKey}}
+ assert.deepEqual(A.barangays.map(b=>b.name),['Pag-asa','New Kalalake','West Tapinac'],'only the 3 barangays');
+ const peopleMap=(await admin('GET','people-map?barangays=1')).j;assert.deepEqual(peopleMap.barangays.map(b=>b.name),['Pag-asa']);assert(peopleMap.residents.length>0&&peopleMap.officials.length>0);assert(peopleMap.residents.every(x=>x.barangay==='Pag-asa'&&Number.isFinite(x.lat)&&Number.isFinite(x.lng)));assert(peopleMap.officials.every(x=>x.barangay==='Pag-asa'&&x.position));assert(!JSON.stringify(peopleMap).includes('email'));
+ const kalalakeMap=(await admin('GET','people-map?barangays=2')).j;assert.deepEqual(kalalakeMap.barangays.map(b=>b.name),['Kalalake']);const residentsOnly=(await admin('GET','people-map?barangays=1&residents=1&officials=0')).j;assert(residentsOnly.residents.length>0&&residentsOnly.officials.length===0&&residentsOnly.barangays[0].counts.officials>0);
+ const brgyMap=(await cap('GET','people-map?barangays=1,2,3')).j;assert.deepEqual(brgyMap.barangays.map(b=>b.name),['Pag-asa']);assert.equal((await city('GET','people-map')).s,403);assert.equal((await ana('GET','people-map')).s,403);
+ console.log('reports admin/cap/sec/city/ana/ben',A.reports.length,C.reports.length,Sc.reports.length,Ci.reports.length,An.reports.length,Be.reports.length);
+ assert(C.reports.every(r=>r.brgy===1)&&Sc.reports.every(r=>r.brgy===2));assert(An.reports.every(r=>r.uid===An.users.find(u=>u.email==='resident@fixit.ph').id));
+ assert(An.reports.every(r=>!('ai' in r))&&!An.users.some(u=>u.role==='admin'||u.email&&u.email!=='resident@fixit.ph'),'resident leak');
+ assert(!JSON.stringify(C).includes('pw'),'pw leak');assert.equal(C.logs.length,0);
+ // cross-barangay access
+ const other=A.reports.find(r=>r.brgy===2);assert.equal((await cap('POST','act',{id:other.id,s:'VERIFIED'})).s,404);
+ const benRep=An.reports[0];assert.equal((await ben('GET','state')).j.S.reports.some(r=>r.id===benRep.id),false);
+ assert.equal((await ana('POST','act',{id:benRep.id,s:'VERIFIED'})).s,403);assert.equal((await ana('POST','user/add',{})).s,403);assert.equal((await cap('GET','state')).s,200);
+ // image access
+ const ir=await fetch(new URL('/api/img/r/1',base));assert.equal(ir.status,401);
+ // create report
+ const originalGeocodeFetch=global.fetch,geocodeRequests=[];global.fetch=async(url,options)=>{if(String(url).startsWith('https://nominatim.openstreetmap.org/')){geocodeRequests.push({url:String(url),options});return{ok:true,json:async()=>String(url).includes('/reverse')?{address:{road:'Rizal Avenue',suburb:'Pag-asa'}}:[{name:'Rizal Avenue',lat:'14.8350',lon:'120.2810'},{name:'Outside Olongapo',lat:'15.1',lon:'121.0'}]}}return originalGeocodeFetch(url,options)};
+ try{const reverse=await ana('GET','geocode/reverse?lat=14.835&lon=120.281');assert.equal(reverse.s,200,JSON.stringify(reverse.j));assert.equal(reverse.j.address.road,'Rizal Avenue');assert.match(geocodeRequests[0].options.headers['User-Agent'],/^OlongapoFixIt\//);assert(geocodeRequests[0].options.headers.Referer,'Nominatim requests identify the app origin');const search=await ana('GET','geocode/search?q=Rizal%20Avenue');assert.equal(search.s,200,JSON.stringify(search.j));assert.equal(search.j.results.length,1,'search results are limited to Olongapo');assert(geocodeRequests[0].options.signal instanceof AbortSignal,'geocoding requests have a timeout')}finally{global.fetch=originalGeocodeFetch}
+ let r=await ana('POST','report',{cat:'Pothole',desc:'',loc:'x',lat:14.8270,lng:120.2867,photo:JPG,locationPhoto:JPG});assert.equal(r.s,200,JSON.stringify(r.j));assert.equal('ai' in r.j,false);const id=r.j.id;console.log('created',r.j.code);
+ assert.equal((await ana('POST','report',{cat:'Nope',brgy:1,desc:'abcdef',lat:14.8,lng:120.2})).s,400);
+ assert.equal((await ana('POST','report',{cat:'Pothole',brgy:1,desc:'abcdef',lat:14.8,lng:120.2,photo:'data:image/jpeg;base64,AAAA'})).s,400);
+ assert.equal((await ana('POST','report',{cat:'Pothole',brgy:1,desc:'<script>x</script>',lat:'abc',lng:1})).s,400);
+ assert.equal((await cap('POST','assign',{id,to:'d1'})).s,400);
+ assert.equal((await cap('POST','act',{id,s:'IN PROGRESS'})).s,400);
+ assert.equal((await cap('POST','act',{id,s:'REJECTED'})).s,400);
+ assert.equal((await cap('POST','act',{id,s:'VERIFIED',rem:'ok'})).s,200);
+ assert.equal((await cap('POST','assign',{id,to:'d1'})).s,200);
+ assert.equal((await sec('POST','assign',{id,to:'d1'})).s,404);
+ const cs=await st(city);assert(cs.reports.some(x=>x.id===id),'city sees assigned');
+ assert.equal((await city('POST','act',{id,s:'IN PROGRESS'})).s,200);
+ assert.equal((await city('POST','resolve',{id,rem:'Fixed'})).s,400);
+ assert.equal((await city('POST','resolve',{id,rem:'Fixed',img:JPG})).s,200);
+ assert.equal((await cap('POST','act',{id,s:'REJECTED',rem:'x'})).s,400);
+ const rs=(await st(ana)).reports.find(x=>x.id===id);assert.equal(rs.status,'RESOLVED');assert(rs.ev[0].img);
+ const nn=(await st(ana)).notifs;console.log('notifs',nn.length);assert(nn.length>=4);
+ const im=await fetch(new URL('/api/img/r/'+id,base),{headers:{cookie:''}});assert.equal(im.status,401);
+ const tr=await anon('GET','track?code='+r.j.code);assert(tr.j.found&&tr.j.resolution&&!JSON.stringify(tr.j).includes('resident'));
+ const pu=await anon('GET','public');assert(pu.j.list.length>0&&!('descr' in pu.j.list[0]));
+ // admin ops
+ assert.equal((await admin('POST','barangay/add',{name:'Test Brgy',lat:14.83,lng:120.28})).s,200);assert.equal((await admin('POST','barangay/add',{name:'test brgy',lat:14.83,lng:120.28})).s,409);
+ assert.equal((await admin('POST','user/add',{name:'O',email:'o@x.ph',password:'Secret123',role:'brgy',brgy:3,pos:'Barangay Staff'})).s,200);
+ assert.equal((await admin('POST','user/add',{name:'O',email:'o@x.ph',password:'Secret123',role:'brgy',brgy:3})).s,409);
+ const nu=await user('o@x.ph','Secret123');assert.equal((await nu('GET','state')).j.S.reports.every(r=>r.brgy===3),true);
+ const uid=(await st(admin)).users.find(u=>u.email==='o@x.ph').id;assert.equal((await admin('POST','user/toggle',{id:uid})).s,200);assert.equal((await nu('GET','state')).j.me,null);
+ assert.equal((await admin('POST','user/toggle',{id:1})).s,400);
+ // residency verification flow
+ const jarOf=async(e,pw)=>{const jar={},f=J(jar);assert.equal((await f('POST','login',{email:e,password:pw})).s,200);return jar};
+ const imgSt=async(jar,id)=>(await fetch(new URL('/api/img/p/'+id,base),{headers:{cookie:jar.c||''}})).status;
+ const good={name:'New Res',email:'new@x.ph',password:'Secret123',age:25,address:'1 Test St, Pag-asa',brgy:1,documentType:'PhilHealth ID',proof:JPG,front:JPG};
+ for(const [k,v] of [['age',''],['age',12],['age',25.5],['age','abc'],['address',''],['brgy',''],['brgy',99],['documentType',''],['front','data:image/jpeg;base64,AAAA']])assert.equal((await J({})('POST','register',{...good,[k]:v})).s,400,'register invalid '+k);
+ const rjar={},reg=J(rjar);assert.equal((await reg('POST','register',good)).s,422,'unreadable ID rejected');
+
+// ===== OCR endpoint tests =====
+// Invalid proof type rejected
+assert.equal((await J({})('POST','ocr',{proof:'data:text/plain,hello'})).s,400,'ocr invalid proof rejected');
+// Missing proof rejected
+assert.equal((await J({})('POST','ocr',{})).s,400,'ocr missing proof rejected');
+// Valid JPG/PNG format but tiny image returns unreadable (not error)
+const ocrRes=await J({})('POST','ocr',{proof:JPG});assert.equal(ocrRes.s,200,JSON.stringify(ocrRes.j));assert(ocrRes.j.status==='unreadable'||ocrRes.j.status==='readable','ocr returns valid status');
+assert.equal((await J({})('POST','ocr',{proof:JPG,documentType:'Philippine National ID (PhilID/ePhilID)',uploadMode:'back'})).s,400,'back mode requires the back image');
+// Register without ocrId still works (falls back to verifyIdAddress) - unreadable ID rejected
+assert.equal((await J({})('POST','register',good)).s,422,'register without ocrId rejects unreadable ID');
+
+assert.equal((await ana('POST','logout',{})).s,200);assert.equal((await ana('GET','state')).j.me,null);
+  // Image verification REJECTED status blocks report creation (tested via UI test with mocked API)
+  const html=await (await fetch(base)).text();assert(html.includes('Olongapo FixIt'));
+  
+  // ===== AI Image Verification Unit Tests =====
+  const imageVerification=require('./src/imageVerification');
+  
+  // Test threshold decision matrix
+  console.log('Testing threshold decision matrix...');
+  {
+    const { decideWithThresholds } = imageVerification;
+    
+    // Test MATCH: score >= 0.30 AND rank === 1
+    let result = decideWithThresholds('Pothole', [
+      { category: 'Pothole', score: 0.35, bestPrompt: 'a photo of a pothole' },
+      { category: 'Damaged Road', score: 0.25, bestPrompt: 'a damaged road' },
+      { category: 'Garbage Problem', score: 0.15, bestPrompt: 'garbage' }
+    ]);
+    assert.equal(result.status, 'MATCH', 'MATCH: high score, rank 1');
+    assert.equal(result.verificationMethod, 'xenova');
+    assert.ok(result.top3Candidates.length === 3, 'top3Candidates present');
+    
+    // Test REJECTED: score < 0.22 AND rank > 3
+    result = decideWithThresholds('Pothole', [
+      { category: 'Damaged Road', score: 0.40, bestPrompt: 'damaged road' },
+      { category: 'Garbage Problem', score: 0.30, bestPrompt: 'garbage' },
+      { category: 'Broken Streetlight', score: 0.25, bestPrompt: 'streetlight' },
+      { category: 'Water Leak', score: 0.20, bestPrompt: 'water' },
+      { category: 'Pothole', score: 0.15, bestPrompt: 'pothole' }
+    ]);
+    assert.equal(result.status, 'REJECTED', 'REJECTED: low score, rank 5');
+    
+    // Test REVIEW_REQUIRED: score < 0.30 but rank <= 3
+    result = decideWithThresholds('Pothole', [
+      { category: 'Damaged Road', score: 0.35, bestPrompt: 'damaged road' },
+      { category: 'Pothole', score: 0.28, bestPrompt: 'pothole' },
+      { category: 'Garbage Problem', score: 0.20, bestPrompt: 'garbage' }
+    ]);
+    assert.equal(result.status, 'REVIEW_REQUIRED', 'REVIEW_REQUIRED: medium score, rank 2');
+    
+    // Test REVIEW_REQUIRED: score >= 0.30 but rank > 1
+    result = decideWithThresholds('Pothole', [
+      { category: 'Damaged Road', score: 0.40, bestPrompt: 'damaged road' },
+      { category: 'Pothole', score: 0.32, bestPrompt: 'pothole' }
+    ]);
+    assert.equal(result.status, 'REVIEW_REQUIRED', 'REVIEW_REQUIRED: high score but rank 2');
+    
+    // Test Unrelated Image category
+    result = decideWithThresholds('Unrelated Image', [
+      { category: 'Unrelated Image', score: 0.50, bestPrompt: 'a cat photo' },
+      { category: 'Pothole', score: 0.10, bestPrompt: 'pothole' }
+    ]);
+    assert.equal(result.status, 'REJECTED', 'Unrelated Image always REJECTED');
+    
+    console.log('  Threshold decision matrix tests passed');
+  }
+  
+  // Test generatePrompts function
+  console.log('Testing generatePrompts...');
+  {
+    const { generatePrompts, PROMPT_TEMPLATES } = imageVerification;
+    
+    const potholePrompts = generatePrompts('Pothole');
+    assert.equal(potholePrompts.length, 8, 'Pothole has 8 prompts');
+    // Most prompts should mention pothole (some are more general)
+    const potholeMentions = potholePrompts.filter(p => p.includes('pothole')).length;
+    assert.ok(potholeMentions >= 5, `At least 5 prompts mention pothole (got ${potholeMentions})`);
+    
+    const unrelatedPrompts = generatePrompts('Unrelated Image');
+    assert.equal(unrelatedPrompts.length, 20, 'Unrelated Image has 20 prompts');
+    
+    const unknownPrompts = generatePrompts('Unknown Category');
+    assert.equal(unknownPrompts.length, 0, 'Unknown category returns empty array');
+    
+    console.log('  generatePrompts tests passed');
+  }
+  
+  // Test aggregateScoresByCategory
+  console.log('Testing aggregateScoresByCategory...');
+  {
+    const { aggregateScoresByCategory } = imageVerification;
+    
+    const ranked = [
+      { category: 'Pothole', prompt: 'pothole 1', score: 0.30 },
+      { category: 'Pothole', prompt: 'pothole 2', score: 0.45 },
+      { category: 'Damaged Road', prompt: 'road 1', score: 0.25 },
+      { category: 'Damaged Road', prompt: 'road 2', score: 0.35 },
+      { category: 'Garbage Problem', prompt: 'garbage 1', score: 0.15 }
+    ];
+    
+    const aggregated = aggregateScoresByCategory(ranked);
+    assert.equal(aggregated.length, 3, 'Three categories aggregated');
+    assert.equal(aggregated[0].category, 'Pothole', 'Pothole ranked first (max score 0.45)');
+    assert.equal(aggregated[0].score, 0.45, 'Max score for Pothole');
+    assert.equal(aggregated[0].bestPrompt, 'pothole 2', 'Best prompt for Pothole');
+    assert.equal(aggregated[1].category, 'Damaged Road', 'Damaged Road ranked second');
+    assert.equal(aggregated[1].score, 0.35, 'Max score for Damaged Road');
+    assert.equal(aggregated[2].category, 'Garbage Problem', 'Garbage Problem ranked third');
+    
+    console.log('  aggregateScoresByCategory tests passed');
+  }
+  
+  // Test unavailableResult includes new fields
+  console.log('Testing unavailableResult schema...');
+  {
+    const { unavailableResult } = imageVerification;
+    
+    const result = unavailableResult('Pothole', 'test reason');
+    assert.equal(result.status, 'AI_UNAVAILABLE');
+    assert.equal(result.verificationMethod, 'xenova');
+    assert.ok(Array.isArray(result.top3Candidates));
+    assert.equal(result.top3Candidates.length, 0);
+    assert.ok('reason' in result);
+    
+    console.log('  unavailableResult schema tests passed');
+  }
+  
+  // Old AI verification endpoint and logic are removed
+  {
+    const ana2=await user('resident@fixit.ph','demo123');
+    const removed=await ana2('POST','report/verify-image',{cat:'Pothole',photo:JPG});
+    assert.equal(removed.s,404,'Old AI verification endpoint is removed');
+  }
+  
+  console.log('ALL TESTS PASSED');srv.close();process.exit(0);
+})().catch(e=>{console.error('FAIL',e);process.exit(1)});
